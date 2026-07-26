@@ -118,10 +118,12 @@ architecture. In order of size:
 Total: 8569 → 3344 ms, with accuracy improving from 0.99322 to 0.99486 against a
 format floor of 0.99493.
 
-## Day 2 — five things that did not work
+## Day 2 — four things that did not work, and one that turned out to work
 
 Kept because a negative result with a mechanism is worth as much as a positive
-one, and these five are the obvious things to try next.
+one, and these are the obvious things to try next. int8 was in this list for a
+day; the correction is at the end of the section, and it is the more useful
+story of the two.
 
 **Overlapping host and device work.** Predicted 25%, delivered 1.4%. Both sides
 pull from the same LPDDR5x — the GEMM streams weights while numpy streams
@@ -134,15 +136,6 @@ it**, by about 3x.
 CPU 829 → 542 GFLOPS, combined 1224 against 1911 if they were independent — 64%
 of the additive estimate. Ceiling 1.13x wall clock for 100% of the CPU, which
 defeats the reason for using the NPU at all.
-
-**int8 on the wide GEMMs.** The speed is real: 1.51x on projections/fc1, 1.36x
-on fc2, 363 ms per pass. The accuracy is not: cosine **0.864** with per-channel
-weights and per-token activations — worse than the stock GELU kernel that was
-already rejected as unusable. Whisper's activation outliers mean one channel of
-1280 sets the token's scale. Keeping fc2 in fp32 gives 0.968, still 400x the
-remaining error budget. SmoothQuant would be a separate project with calibration
-and host-side scale bookkeeping, i.e. re-adding exactly the host work that was
-just removed.
 
 **AMD's own kernel optimisation catalogue** (`skills/aie-kernel-opt` in the
 mlir-aie tree). Its levers apply by the letter, and its precedent claims −47%.
@@ -157,6 +150,59 @@ rejected months earlier ("online rescale needs an fp32 vector multiply, which
 AIE2 lacks") was **wrong** — the rescale lives in an fp32 accumulator with bf16
 multiplies; and AMD's own driver comments say a 4×4 array can only do one head
 at a time, which contradicts the obvious "one column per head" layout.
+
+### int8, and how a negative result got written down wrong
+
+The speed was never in doubt: 1.51x on projections/fc1, 1.36x on fc2, 363 ms per
+pass, with per-channel weight scales and per-token activation scales on the 290
+projection and MLP GEMMs. What was written down was that the accuracy killed it —
+cosine **0.864**, worse than the stock GELU kernel that had already been rejected
+as unusable, blamed on whisper's activation outliers (one channel of 1280 sets
+the token's scale). Keeping fc2 in fp32 lifted it to 0.968, still 400x the
+remaining error budget, so it went into the list above as closed.
+
+Two things were wrong with that.
+
+The smaller one is that the transcript, not cosine, is this project's acceptance
+criterion — the README says so about the bf16 path in the same breath — and the
+int8 run had never been decoded. The rest of the day had been spent establishing
+that a 0.999 cosine bar is a tiny-only artefact, and then a quantisation scheme
+was thrown away on a cosine number anyway.
+
+The larger one only surfaced when it *was* decoded. The first decode run produced
+garbage in every mode, which looked like a spectacular confirmation, except that
+the fp32 control — the identical path with no quantisation at all — produced
+garbage too. Nothing that path does can corrupt an unquantised encoder, so the
+fault had to be outside the quantisation. It was: the features came from
+`large-v3-turbo` and were being decoded with the `large-v3` model. Encoder and
+decoder from different checkpoints, and a whisper decoder handed foreign
+cross-attention features does not fail, it confabulates. The one number that had
+been carried along as a sanity check, `avg_logprob`, was actively misleading: a
+degenerate `'Mr. Mr. Mr. …'` repetition loop scored **−0.168** against the
+reference's −0.078. A loop is confident. That control is why
+`bench/probe_int8_decode.py` runs fp32 first and always.
+
+Decoded correctly, against the torch reference encoder on 27 live Russian panel
+recordings (2.5–60 s, about 24 distinct utterances): fp32 control 27/27
+character-identical, int8 per-channel **21/27** at cosine 0.784–0.925,
+per-tensor 20/27 at 0.769–0.912. Of the six per-channel differences, two are
+punctuation only, two are the same politeness form on the same slurred phrase,
+one is a tie on an unintelligible word, and one is int8 being *right* where the
+fp32 reference is wrong. There is no semantic failure in the set, and the
+longest recording carrying real speech (22.6 s, a full sentence) matches at
+0.913. The 29 s and 60 s files match too, but both are near-silent — the
+reference itself decodes the 60 s one to a single `'и'` — so a match there says
+nothing, and it is worth noticing that this degenerate sample is what sets the
+top of the cosine range.
+
+So cosine at this depth is not a proxy for the criterion at all — it fell to
+0.784 while the text stayed correct. The 363 ms is back on the table, with the
+honest caveat that the quality was measured in a numpy simulation of the
+quantisation and the speed on the device: a real kernel has bf16 inputs and a
+different accumulation order, so it has to be measured again once it exists.
+SmoothQuant remains unmeasured, and would still be a separate project with
+calibration and host-side scale bookkeeping, i.e. re-adding exactly the host work
+that had just been removed.
 
 ## What the process looked like
 

@@ -144,7 +144,7 @@ profile rather than by having good ideas:
 
 ### What did *not* pay off
 
-Five optimisations were implemented or probed and closed with numbers. They are
+Four optimisations were implemented or probed and closed with numbers. They are
 listed because a negative result with a mechanism saves the next person a week:
 
 - **Overlapping host work with device work — 1.4%, not the 25% predicted.** Both
@@ -154,16 +154,63 @@ listed because a negative result with a mechanism saves the next person a week:
 - **Splitting a GEMM across CPU and NPU — 64% of the additive estimate.** With
   both busy: NPU 1082 → 682 GFLOPS, CPU 829 → 542. Ceiling 1.13x wall for 100%
   of the CPU, which defeats the point.
-- **int8 on the wide GEMMs — fast, but unusable.** 1.51x/1.36x on the shapes,
-  363 ms saved; cosine **0.864** with per-channel weights and per-token
-  activations (whisper's activation outliers: one channel of 1280 sets the
-  scale). Keeping fc2 in fp32 gives 0.968, still 400x our remaining error budget.
 - **AMD's own `skills/aie-kernel-opt` catalogue — 14% slower on our kernels.**
   Its precedents are convolution kernels with scalar gathers and branches;
   `gelu_row4` is already a straight vector loop with compile-time constants, so
   full unrolling only raises register pressure.
 - **Fused flash-attention — built, correct, and still loses.** In the tree,
   disabled by default. See below.
+
+### int8 on the wide GEMMs: closed on cosine, reopened on transcripts
+
+This was a fifth entry in the list above, rejected on a cosine number. The
+rejection was wrong, and the way it was wrong is the point.
+
+int8 on the projection and MLP GEMMs (290 of them, attention left in fp32, with
+per-token activation scales and per-channel weight scales) is worth 1.51x on
+projections/fc1 and 1.36x on fc2 — **363 ms per pass**. It costs cosine: 0.78
+to 0.93 against the torch fp32 encoder, well under the 0.99486 the bf16 path
+holds. On that number it was closed as unusable.
+
+Re-measured against the acceptance criterion — the transcript — on 27 live
+Russian panel recordings, 2.5 s to 60 s (about 24 distinct utterances; a few
+short ones are byte-identical repeat tests):
+
+| configuration | transcripts identical to the torch reference | cosine |
+|---|---|---|
+| fp32 control (same path, no quantisation) | **27 / 27** | ~1.00000 |
+| int8, per-channel weights, per-token activations | **21 / 27** | 0.784 – 0.925 |
+| int8, per-tensor weights (the coarsest scheme) | **20 / 27** | 0.769 – 0.912 |
+
+Not one of the six per-channel differences is a semantic failure. Two are
+punctuation only (`Доброе утро!` → `Доброе утро.`, and one where int8 inserts
+the *correct* comma); two are the same politeness form on the same slurred
+phrase (`разберись` → `разберитесь`); one is a tie on a word that is
+unintelligible in the audio; and in one **int8 is right where the fp32 reference
+is wrong** (`Даня расписание` → `Дай мне расписание`). The longest recording
+that carries real speech — 22.6 s, a full sentence — matches at cosine 0.913.
+The 29 s and 60 s files also match, but they are near-silent and their reference
+transcripts are `'Я здесь! Я здесь!'` and a bare `'и'`, so they are evidence of
+nothing; the 60 s one is where the 0.925 top of the cosine range comes from.
+
+So cosine is not merely not the criterion here — at this depth it is not a good
+proxy for one. Neither is `avg_logprob`: in the broken run described below, a
+degenerate `'Mr. Mr. Mr. …'` repetition loop scored −0.168 against a reference
+of −0.078, because a loop is *confident*. Only the transcript separates these
+cases.
+
+Two things this does not say. The 363 ms is **available, not banked** — the
+quality numbers come from a numpy simulation of the quantisation, and a kernel
+would have bf16 inputs and a different accumulation order, so device-side
+quality has to be re-measured once one exists. And 27 short command-style
+utterances in one language are a probe, not a corpus — the same gap the accuracy
+entry under [Known limits](#known-limits) admits about the bf16 path.
+
+The reproducer is [bench/probe_int8_decode.py](bench/probe_int8_decode.py). It
+runs the fp32 control first and always: the original wrong conclusion came from
+decoding `large-v3-turbo` features with the `large-v3` model, which garbles
+every mode including the unquantised control — which is exactly how it was
+caught.
 
 ### Fused attention: a working negative result
 
@@ -329,7 +376,9 @@ The runtime-characteristic probes are the measured backing for the claims above:
 `probe_ctx.py` (hw_context ceiling), `probe_switch.py` / `probe_switch_n.py`
 (design-switch cost), `probe_floor.py` (per-shape GEMM rate),
 `probe_xrt_chain.py` (per-call latency, chaining), `probe_bo_share.py`
-(cross-design buffer reuse).
+(cross-design buffer reuse). `probe_int8_decode.py` is the odd one out: no NPU,
+it simulates int8 quantisation in numpy over a corpus of wavs and judges it on
+the decoded transcript — see [int8 above](#int8-on-the-wide-gemms-closed-on-cosine-reopened-on-transcripts).
 
 ### `tests/` — the acceptance gate
 
@@ -456,8 +505,22 @@ compiles a design. If MLIR-AIE lives somewhere other than `/opt/mlir-aie`, set
 
 ## Known limits
 
-- Only the encoder is on the NPU. The decoder is small for `large-v3-turbo`
-  (~63 ms of a 2234 ms recognition) and stays on the CPU.
+- Only the encoder is on the NPU. The decoder stays on the CPU, and not only
+  because it is small for `large-v3-turbo` (~63 ms of a 2234 ms recognition) —
+  it is the wrong shape for this device. Decoding is autoregressive, one token
+  per step, so every GEMM degenerates to a matrix-vector product: ~815 M weights
+  read per token, 1.6 GB in bf16, against ~1.7 GFLOP of arithmetic. That is
+  ~1.1 FLOP/byte against a machine balance point near 15 — deeply memory-bound,
+  on an NPU that shares the LPDDR5x with the CPU (the same contention that held
+  host/device overlap to 1.4% instead of the predicted 25%, above). Three
+  further multipliers, all against: the deployed whisper.cpp reads q5_0
+  (~640 MB/token) where an NPU path would read bf16, a threefold loss on a
+  workload where time *is* bytes; per-call cost is ~1.1–1.3 ms with at least one
+  call per layer per token, so 32 × 1.2 ms ≈ 38 ms per token against a 63 ms
+  decoder for the whole recording; and the KV cache grows every token while
+  MLIR-AIE compiles static shapes. Batching or speculative decoding would raise
+  the arithmetic intensity enough to change this — neither applies at batch 1,
+  which is what a single-user endpoint is.
 - Accuracy on large-v3 is validated by transcription on three clips, not by a
   cosine bar (which is a tiny-only artefact); a large corpus with CER/WER would
   be a stronger claim than three clips.
@@ -468,6 +531,39 @@ compiles a design. If MLIR-AIE lives somewhere other than `/opt/mlir-aie`, set
   between stages and the 6-context ceiling.
 - Shapes are padded to tile granularity, so sequence length 1500 is computed as
   1536; the padding is stripped before softmax.
+
+## What else exists, and why it does not cover this case
+
+Whisper on Ryzen AI is not new. The opening claim is narrower than that: *Linux,
+XDNA1, open tooling only*. Everything below was checked in July 2026.
+
+- **AMD's whisper.cpp fork** — [amd/whisper.cpp](https://github.com/amd/whisper.cpp),
+  documented at
+  [ryzenai.docs.amd.com](https://ryzenai.docs.amd.com/en/latest/whisper_cpp.html).
+  Full encoder offload, and the closest thing to this project in intent. Its own
+  documentation: "NPU acceleration is currently supported on Windows only, with
+  Linux support planned." It targets the Ryzen AI 300 Series, i.e. XDNA2. This
+  is Linux on XDNA1.
+- **AMD's RyzenAI-SW ASR demo** —
+  [RyzenAI-SW/Demos/ASR/Whisper](https://github.com/amd/RyzenAI-SW/tree/main/Demos/ASR/Whisper).
+  base/small/medium plus `large-v3-turbo`, in **BFP16** ("near-FP32 accuracy at
+  INT8-like performance"). It needs the Ryzen AI SDK, a `ryzen-ai-<version>`
+  conda environment and ONNX Runtime with the VitisAI execution provider — the
+  account-gated stack the first paragraph of this README rules out. If you are
+  willing to install it, this is the supported path and you should use it.
+- **Third-party int8 checkpoints**, e.g.
+  [magicunicorn/whisper-large-v3-amd-npu-int8](https://huggingface.co/magicunicorn/whisper-large-v3-amd-npu-int8)
+  and its siblings. These claim WER 1.0% on LibriSpeech test-clean, RTF 0.0045,
+  "220x faster than CPU", with both encoder *and* decoder on the NPU of a Ryzen
+  7040/8040. Two problems. The repositories contain no weights — `.gitattributes`,
+  `README.md` and `config.json`, 11.8 kB in total. And the speed claim does not
+  survive arithmetic: the large-v3 encoder is ~2.26 TFLOP per 30 s window
+  (32 layers × ~70.5 GFLOP — QKVO `4×2·1500·1280·1280`, MLP
+  `2×2·1500·1280·5120`, QKᵀ and AV `2×2·1500·1500·1280`), so an hour of audio is
+  ~271 TFLOP, which at the 16 TOPS int8 peak of this class of part is ~16.9 s
+  **at 100% of peak, encoder only** — against a claimed 16.2 s that also
+  includes a decoder. The WER is quoted without an fp32 baseline on the same
+  harness.
 
 ## Not in the repository
 
