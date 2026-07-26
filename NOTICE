@@ -1,0 +1,42 @@
+whisper on the AMD XDNA NPU
+Copyright (c) 2026 Mikhail Kostryukov
+
+Everything original here is MIT (see LICENSE). Three groups of files are
+derived from upstream projects and keep their own licence and copyright:
+
+1. Row-wise AIE2 kernels — Apache-2.0 WITH LLVM-exception
+
+     kernels/layer_norm_gb.cc
+     kernels/gelu_row.cc, gelu_row2.cc, gelu_row3.cc, gelu_row4.cc,
+             gelu_row4_rne.cc, gelu_row4f.cc, gelu_poly4_eval.inc
+     kernels/softmax_row.cc, softmax_row2.cc, softmax_row3.cc,
+             softmax_row4.cc, softmax_row4_rne.cc, softmax_row4_body.inc
+
+   Written against aie_kernels/ in https://github.com/Xilinx/mlir-aie, which is
+   released under the Apache License v2.0 with LLVM Exceptions. Each file
+   carries the matching SPDX tag.
+
+   MLIR-AIE also ships programming_examples/ml/magika, which contains a Phoenix
+   layernorm under LicenseRef-AMD-Proprietary. Nothing here derives from it:
+   layer_norm_gb.cc is written against the Apache-licensed aie2p kernel.
+
+2. Attention kernels — MIT, Copyright (C) 2025 Advanced Micro Devices, Inc.
+
+     kernels/attn_g_b_f32.inc   generated from AMD's matmul_g_b_bf16, with the
+                                C operand changed from bf16 to fp32
+     kernels/attn_mmul.cc       wrapper around AMD's attn_npu1.cc
+     kernels/attn_fused.cc      standalone reference implementation of the same
+                                fused step, written against the AIR examples
+
+   Source: programming_examples/flash_attention/ in
+   https://github.com/Xilinx/mlir-air (MIT). attn_npu1.cc itself is NOT vendored
+   here; point AIR_DIR at a checkout of that repository to build the fused
+   attention path.
+
+3. Test audio
+
+     tests/data/test_en.wav     see tests/data/README.md
+
+The runtime stack the container builds on — XRT, MLIR-AIE/IRON, llvm-aie
+(peano), openai-whisper, PyTorch — is fetched at build time and keeps its own
+licences; none of it is redistributed in this repository.

@@ -1,0 +1,19 @@
+# Generated or huge; all of it is rebuilt inside the image or on first run.
+aot/
+*.xclbin
+*.bin
+*.prj/
+ref.npz
+ref_lv3.npz
+ref_s*.npz
+out*.npy
+fc1_acts.npy
+gelu_poly*.npz
+core.*
+refenv/
+ironenv/
+__pycache__/
+*.pyc
+.git/
+# audio brought in for testing — never ship it in the image
+samples/

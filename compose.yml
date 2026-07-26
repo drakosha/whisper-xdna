@@ -1,0 +1,73 @@
+# The NPU shows up as /dev/accel/accel0, owned by group `render`. Container
+# processes need that group, so pass the host's gid:
+#
+#   RENDER_GID=$(getent group render | cut -d: -f3) docker compose up -d npu-whisper
+#   docker compose exec npu-whisper python3 bench/run_raw_encoder.py
+#
+# The `stt` service is the HTTP endpoint instead of a shell; it needs the image
+# built WITH_REFERENCE=1, since the decoder runs in torch:
+#
+#   RENDER_GID=... WITH_REFERENCE=1 docker compose up -d stt
+#
+# Nothing here is privileged, but XRT locks its device buffers, so the
+# container needs IPC_LOCK and an unbounded memlock — without them the first
+# BO mmap fails with EAGAIN and the NPU looks unopenable.
+
+x-npu: &npu
+  build:
+    context: .
+    args:
+      WITH_REFERENCE: "${WITH_REFERENCE:-0}"
+  # Set NPU_WHISPER_IMAGE to a published tag to run the prebuilt image instead
+  # of building it: ghcr.io/drakosha/npu-whisper or kostryukov/npu-whisper.
+  # `docker compose build` names what it builds the same way.
+  image: ${NPU_WHISPER_IMAGE:-npu-whisper:latest}
+  devices:
+    - /dev/accel/accel0
+    - /dev/dri
+  group_add:
+    - "${RENDER_GID:-992}"
+  cap_add:
+    - IPC_LOCK
+  ulimits:
+    memlock: -1
+  volumes:
+    # Both caches outlive the container, which is the point: overlays are
+    # minutes to compile and the checkpoint is ~1.6 GB to fetch. Named volumes
+    # rather than bind mounts — nothing lands in the checkout. Bind them to a
+    # directory of your own if you want to look inside.
+    - aot:/opt/npu-whisper/aot
+    - models:/root/.cache/whisper
+
+services:
+  npu-whisper:
+    <<: *npu
+    container_name: npu-whisper
+    command: sleep infinity
+
+  stt:
+    <<: *npu
+    container_name: npu-whisper-stt
+    command: serve/run.sh
+    ports:
+      - "${STT_PORT:-8090}:8090"
+    environment:
+      # Set STT_CPU_URL to a whisper.cpp /inference endpoint to have failed,
+      # undecodable or busy requests proxied there instead of erroring.
+      STT_CPU_URL: "${STT_CPU_URL:-}"
+      # Both the NPU encoder weights and the CPU decoder come from this one
+      # checkpoint. large-v3 also works; the smaller models are 80-mel and have
+      # never been run through the serving path.
+      NPU_STT_MODEL: "${NPU_STT_MODEL:-large-v3-turbo}"
+      NPU_STT_LANG: "${NPU_STT_LANG:-ru}"
+      # Contexts to compile overlays for; a request is rounded up onto them.
+      NPU_STT_LADDER: "${NPU_STT_LADDER:-512,768,1024,1280,1500}"
+      # Other NPU_STT_* knobs (see serve/npu_stt_server.py) go here too — the
+      # container sees only what this block passes through.
+    # No restart policy on purpose: under serve/units/npu-stt.service systemd is
+    # the supervisor, and two of them fight over the same container. Add one
+    # here if you run compose without systemd.
+
+volumes:
+  aot:
+  models:

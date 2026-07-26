@@ -1,0 +1,25 @@
+# compiled AIE overlays — rebuilt on demand (1–2 min each)
+aot/
+*.xclbin
+*.bin
+# build scratch left by the MLIR-AIE compiler
+*.prj/
+core.*
+
+# generated references and encoder outputs
+ref.npz
+ref_lv3.npz
+ref_s*.npz
+out*.npy
+fc1_acts.npy
+gelu_poly*.npz
+
+# audio brought in for testing — recordings are nobody else's business
+samples/
+
+# environments
+refenv/
+ironenv/
+__pycache__/
+*.pyc
+.ruff_cache/
