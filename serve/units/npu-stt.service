@@ -1,0 +1,25 @@
+[Unit]
+# Runs the `stt` service from the repo's compose.yml, which publishes 8090 and
+# passes the NPU device through. Put the checkout in /opt/npu-whisper, or edit
+# WorkingDirectory. RENDER_GID has to match the host's `render` group:
+#   echo "RENDER_GID=$(getent group render | cut -d: -f3)" > /etc/default/npu-stt
+Description=NPU whisper STT (XDNA1 encoder + CPU large-v3-turbo decoder)
+Documentation=file:/opt/npu-whisper/serve/README.md
+Requires=docker.service
+After=docker.service network-online.target
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/npu-whisper
+EnvironmentFile=-/etc/default/npu-stt
+ExecStart=/usr/bin/docker compose up stt
+ExecStop=/usr/bin/docker compose stop stt
+Restart=always
+RestartSec=15
+# First start downloads the whisper checkpoint and compiles the overlays for
+# every context on the ladder; both are cached, so only the first one is slow.
+TimeoutStartSec=1800
+TimeoutStopSec=60
+
+[Install]
+WantedBy=multi-user.target
